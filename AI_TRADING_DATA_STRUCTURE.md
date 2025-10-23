@@ -1,7 +1,7 @@
 # AI自主交易系统数据结构设计与落地规划（适配 GridBNB-USDT）
 
 更新日期: 2025-10-22
-版本: 2.1（以“数据源优先”的分阶段规划重构，仅文档，不含代码）
+版本: 2.2（以“数据源优先”的分阶段规划重构；补充 Hyperliquid 评估，仅文档，不含代码）
 
 ---
 
@@ -33,6 +33,19 @@ AITradingContext（输入，v2.0）最小骨架（示例）
   "plus_sentiment": {"fear_greed": null},
   "plus_macro": {"btc_dominance": null, "usd_index": null},
   "quality": {"stale_flags": [], "missing_optional": [], "source_watermark": {"binance": 1698000000060}}
+}
+
+可扩展字段（多源融合，建议在 D1 加入）
+{
+  "plus_derivatives_sources": {
+    "binance": {"funding_rate": 1.2e-5, "open_interest": 25120.3},
+    "hyperliquid": {"funding_rate": 1.1e-5, "open_interest": 26010.8}
+  },
+  "plus_derivatives_ensemble": {
+    "funding_rate_mean": 1.15e-5,
+    "oi_spread": 890.5,
+    "divergence_flags": {"funding_rate": false, "oi": true}
+  }
 }
 
 AITradingDecision（输出，v1.0）保留不变，详见上一版文档（action: adjust_grid/place_order/cancel/...）。
@@ -80,17 +93,41 @@ AITradingDecision（输出，v1.0）保留不变，详见上一版文档（actio
     - funding rate: /fapi/v1/fundingRate（或 ccxt 对应原生方法）
     - open interest: /fapi/v1/openInterest
     - 辅助（可选）：/futures/data 全局多空比
+  - Hyperliquid Derivatives（REST/WebSocket，免费，作为补充源）：
+    - funding rate、open interest、orderbook/trades（具体端点以官方文档为准）
+    - 用途：与 Binance 做交叉验证，生成 divergence 与 ensemble 特征
   - ccxt.binance：fetch_trades(symbol, limit=)
 - 成本：免费
 - 刷新/TTL/速率预算
-  - funding_rate: 8h；TTL=8h
-  - open_interest: 10-60s；TTL=10-60s
+  - funding_rate: 8h；TTL=8h（两源同样）
+  - open_interest: 10-60s；TTL=10-60s（两源同样）
   - trades: 2-10s；TTL=5s
   - 多档深度: 2-5s；TTL=3s
 - 验收标准
   - 字段完整率>95%；
-  - 与第三方对照抽检 funding_rate/OI 误差<1%；
-  - 速率预算在 Binance 1200 权重/分钟内可控。
+  - 跨交易所 funding_rate/OI 30日相关性>0.95，且异常分歧样本可解释；
+  - 速率预算在 Binance 1200 权重/分钟内可控，Hyperliquid 接口无超限告警。
+
+D1（可选）Hyperliquid 数据源：定位与对比
+- 是否已在清单：此前未列入，现纳入 D1-Optional 作为“衍生品数据的第二来源”。
+- 定位
+  - 作为信号增强与交叉验证来源，不改变当前“在 Binance 现货执行”的交易路径。
+  - 解决单一交易所数据偏差问题，增强市场状态识别鲁棒性。
+- 字段映射
+  - plus_derivatives_sources.hyperliquid.funding_rate/open_interest
+  - plus_derivatives_ensemble：funding_rate_mean、oi_spread、divergence_flags
+- 优势
+  - 提供免费/低延迟的衍生品行情与指标（WebSocket/REST）。
+  - 与 Binance 的多源融合可降低特例噪声与单点失真。
+- 劣势/注意事项
+  - 符号映射差异（命名、计价单位、是否USDT本位）。
+  - 市场微结构不同（去中心化撮合/深度、对手盘分布），与 Binance 指标不可直接等同。
+  - 需要定义统一规范：资金费率口径、OI 统计口径、时间戳同步与时区。
+- 更新策略
+  - funding_rate：8h；open_interest：10-30s；orderbook/trades：1-2s（仅用于特征，不直接驱动下单）。
+- 验收
+  - 与 Binance 的历史对齐：funding_rate 差值分布稳定；OI 相关性>0.95；
+  - 出现显著分歧时，divergence_flags 正确点亮，并可关联行情事件解释。
 
 阶段 D2（免费/低成本｜外部增强）
 - 覆盖字段
@@ -167,10 +204,16 @@ constraints
   - 频率: 启动+每1-6h 或失败回退时刷新
 
 plus_derivatives（D1）
-- funding_rate
+- funding_rate（Binance）
   - 来源: Binance Futures /fapi/v1/fundingRate（或 ccxt 原生）；免费；8h
-- open_interest
+- open_interest（Binance）
   - 来源: Binance Futures /fapi/v1/openInterest；免费；10-60s
+- funding_rate（Hyperliquid，可选）
+  - 来源: Hyperliquid 官方 REST/WebSocket；免费；8h（或按其官方节奏）
+- open_interest（Hyperliquid，可选）
+  - 来源: Hyperliquid 官方 REST/WebSocket；免费；10-60s
+- ensemble 与衍生特征（自计算）
+  - funding_rate_mean、oi_spread、divergence_flags
 
 plus_sentiment（D2）
 - fear_greed
@@ -233,9 +276,10 @@ D0 任务（现货核心，免费）
 
 D1 任务（交易所增强，免费）
 - 接 Futures REST：funding_rate/open_interest；
+- 接入可选 Hyperliquid 衍生品数据；
 - trades/深度增强：volume_ratio、异常检测；
 - 速率与缓存：OI 10-60s，trades 2-10s，多档深度 2-5s；
-- 验收：字段对齐、对照抽检误差<1%。
+- 验收：字段对齐、对照抽检误差<1%，跨所相关性>0.95。
 
 D2 任务（外部增强，免费/低成本）
 - 接 Alternative.me、CoinGecko；
